@@ -1,0 +1,797 @@
+---
+title: "Evaluating Alert Fatigue Codebook"
+author: "Brianna Jackson"
+date: "2026-03-30"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "C:/Users/brian/OneDrive/Documents")
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 8,
+  fig.height = 5,
+  dpi = 150
+)
+
+library(data.table)
+library(MASS)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(broom) 
+library(dplyr)  # always last
+```
+
+```{r load-data, echo=FALSE}
+cohort <- fread("C:/Users/brian/OneDrive/Documents/mimic_icustay_cohort_final.csv")
+
+prescriptions <- fread(
+  "C:/Users/brian/OneDrive/Documents/prescriptions.csv.gz",
+  select = c("subject_id", "hadm_id", "starttime", "stoptime", "drug")
+)
+prescriptions$starttime <- as.POSIXct(prescriptions$starttime)
+cohort$intime           <- as.POSIXct(cohort$intime)
+
+cohort_lookup <- cohort %>%
+  dplyr::select(hadm_id, intime, icu_los_days) %>%
+  distinct(hadm_id, .keep_all = TRUE)
+
+prescriptions_cohort <- prescriptions %>%
+  dplyr::filter(hadm_id %in% cohort$hadm_id, !is.na(starttime)) %>%
+  left_join(cohort_lookup, by = "hadm_id") %>%
+  mutate(
+    order_hour        = as.integer(format(starttime, "%H")),
+    hours_since_admit = as.numeric(difftime(starttime, intime, units = "hours")),
+    day_of_stay       = floor(hours_since_admit / 24) + 1,
+    shift = factor(case_when(
+      order_hour >= 7  & order_hour < 15 ~ "Day (7am-3pm)",
+      order_hour >= 15 & order_hour < 23 ~ "Evening (3pm-11pm)",
+      TRUE                               ~ "Night (11pm-7am)"
+    ), levels = c("Day (7am-3pm)", "Evening (3pm-11pm)", "Night (11pm-7am)"))
+  ) %>%
+  dplyr::filter(hours_since_admit >= 0)
+
+hourly_counts <- prescriptions_cohort %>%
+  group_by(order_hour) %>%
+  summarise(n_orders = n(), .groups = "drop") %>%
+  mutate(pct = n_orders / sum(n_orders) * 100)
+
+top_hours <- hourly_counts %>% arrange(desc(n_orders)) %>% slice(1:3)
+
+shift_summary <- prescriptions_cohort %>%
+  group_by(shift) %>%
+  summarise(
+    n_orders = n(),
+    pct      = round(n() / nrow(prescriptions_cohort) * 100, 1),
+    .groups  = "drop"
+  )
+
+daily_burden <- prescriptions_cohort %>%
+  dplyr::filter(day_of_stay >= 1, day_of_stay <= 14) %>%
+  group_by(day_of_stay) %>%
+  summarise(
+    n_orders       = n(),
+    n_admissions   = n_distinct(hadm_id),
+    orders_per_adm = n_orders / n_admissions,
+    .groups = "drop"
+  )
+
+burst_metric <- cohort %>%
+  dplyr::select(hadm_id, max_burst_60min, burst_category) %>%
+  dplyr::filter(!is.na(max_burst_60min))
+
+# Winsorize lab events at 99th percentile (as documented in preprocessing notes)
+p99_lab <- quantile(cohort$n_lab_events, 0.99, na.rm = TRUE)
+cohort <- cohort %>%
+  mutate(n_lab_events_w = pmin(n_lab_events, p99_lab))
+
+scenario_long <- data.frame(
+  Events   = c(cohort$total_events, cohort$scenario1_events,
+               cohort$scenario2_events, cohort$scenario3_events),
+  Scenario = rep(c("Baseline", "S1: Rx Dedup -15%",
+                   "S2: Lab Dedup -20%", "S3: Combined"), each = nrow(cohort))
+) %>%
+  dplyr::filter(Events < 3000) %>%
+  mutate(Scenario = factor(Scenario,
+    levels = c("Baseline", "S1: Rx Dedup -15%",
+               "S2: Lab Dedup -20%", "S3: Combined")))
+```
+
+------------------------------------------------------------------------
+
+# Dataset Overview
+
+```{r overview-table}
+overview <- data.frame(
+  Item  = c("Data Source", "Unit of Analysis", "Total Observations",
+            "Total Variables", "Date Constructed", "Software"),
+  Value = c(
+    "MIMIC-IV (PhysioNet / Beth Israel Deaconess Medical Center)",
+    "ICU stay (stay_id), linked to hospital admission (hadm_id)",
+    format(nrow(cohort), big.mark = ","),
+    ncol(cohort),
+    "March 2026",
+    "R 4.x with data.table, dplyr, MASS, DuckDB, lubridate"
+  )
+)
+
+kable(overview, col.names = c("", ""), booktabs = TRUE,
+      caption = "Table 1. Dataset Summary") %>%
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+------------------------------------------------------------------------
+
+# Variable Codebook
+
+```{r codebook-table}
+codebook <- data.frame(
+  Variable = c(
+    "subject_id", "hadm_id", "stay_id",
+    "anchor_age", "gender", "first_careunit",
+    "admittime", "dischtime", "intime", "outtime",
+    "hospital_los_days", "icu_los_hours", "icu_los_days",
+    "n_prescriptions", "n_unique_drugs", "rx_per_day",
+    "n_lab_events", "n_unique_labitems", "n_abnormal_labs", "labs_per_day",
+    "total_events", "total_events_per_day",
+    "scenario1_events", "scenario2_events", "scenario3_events",
+    "max_burst_60min", "burst_category"
+  ),
+  Type = c(
+    "Integer", "Integer", "Integer",
+    "Integer", "Factor", "Factor",
+    "POSIXct", "POSIXct", "POSIXct", "POSIXct",
+    "Numeric", "Numeric", "Numeric",
+    "Integer", "Integer", "Numeric",
+    "Integer", "Integer", "Integer", "Numeric",
+    "Integer", "Numeric",
+    "Integer", "Integer", "Integer",
+    "Integer", "Factor"
+  ),
+  Source = c(
+    rep("MIMIC-IV: icustays / patients / admissions", 3),
+    rep("MIMIC-IV: patients", 2), "MIMIC-IV: icustays",
+    rep("MIMIC-IV: admissions", 2), rep("MIMIC-IV: icustays", 2),
+    rep("Derived", 3),
+    rep("MIMIC-IV: prescriptions (aggregated)", 2), "Derived",
+    rep("MIMIC-IV: labevents (aggregated)", 3), "Derived",
+    rep("Derived", 2),
+    rep("Simulated (scenario analysis)", 3),
+    rep("Derived: prescriptions timestamps", 2)
+  ),
+  Description = c(
+    "Unique patient identifier",
+    "Hospital admission ID; primary join key across tables",
+    "ICU stay identifier",
+    "Patient age at MIMIC-IV anchor year",
+    "Patient sex (M = Male, F = Female)",
+    "ICU unit type at time of admission",
+    "Hospital admission timestamp",
+    "Hospital discharge timestamp",
+    "ICU admission timestamp",
+    "ICU discharge timestamp",
+    "Hospital length of stay in days (dischtime - admittime)",
+    "ICU length of stay in hours (outtime - intime)",
+    "ICU length of stay in days (icu_los_hours / 24)",
+    "Total medication prescription orders per hospital admission",
+    "Count of distinct drug names ordered per hospital admission",
+    "Medication orders per ICU day (n_prescriptions / icu_los_days)",
+    "Total laboratory measurements per hospital admission",
+    "Count of distinct laboratory item types per admission",
+    "Laboratory measurements flagged as abnormal",
+    "Lab events per ICU day (n_lab_events / icu_los_days)",
+    "Total CDS-triggering events (n_prescriptions + n_lab_events)",
+    "Total events per ICU day (total_events / icu_los_days)",
+    "Simulated burden: Rx orders reduced 15% (deduplication scenario)",
+    "Simulated burden: Lab events reduced 20% (suppression scenario)",
+    "Simulated burden: Combined Rx -15% and Lab -20%",
+    "Maximum medication orders in any 60-minute window per admission",
+    "Burst intensity category: Low / Moderate / High / Very High"
+  )
+)
+
+kable(codebook, booktabs = TRUE, longtable = TRUE,
+      caption = "Table 2. Variable Codebook — All 27 Variables") %>%
+  kable_styling(font_size = 10) %>%
+  column_spec(1, bold = TRUE, width = "1.6in") %>%
+  column_spec(2, width = "0.7in") %>%
+  column_spec(3, width = "1.6in") %>%
+  column_spec(4, width = "3in")
+```
+
+------------------------------------------------------------------------
+
+# Descriptive Statistics
+
+```{r desc-stats}
+desc <- cohort %>%
+  dplyr::summarise(
+    across(
+      c(n_prescriptions, n_unique_drugs, rx_per_day,
+        n_lab_events, n_unique_labitems, n_abnormal_labs,
+        total_events, total_events_per_day,
+        max_burst_60min, icu_los_days, anchor_age),
+      list(
+        N      = ~sum(!is.na(.)),
+        Mean   = ~round(mean(., na.rm = TRUE), 1),
+        SD     = ~round(sd(., na.rm = TRUE), 1),
+        Median = ~round(median(., na.rm = TRUE), 1),
+        Q1     = ~round(quantile(., 0.25, na.rm = TRUE), 1),
+        Q3     = ~round(quantile(., 0.75, na.rm = TRUE), 1),
+        Min    = ~round(min(., na.rm = TRUE), 1),
+        Max    = ~round(max(., na.rm = TRUE), 1)
+      )
+    )
+  ) %>%
+  tidyr::pivot_longer(everything(),
+    names_to  = c("Variable", "Stat"),
+    names_sep = "_(?=[^_]+$)",
+    values_to = "Value"
+  ) %>%
+  tidyr::pivot_wider(names_from = Stat, values_from = Value)
+
+kable(desc, booktabs = TRUE,
+      caption = "Table 3. Descriptive Statistics: Burden and Temporal Variables") %>%
+  kable_styling(font_size = 9)
+```
+
+```{r cohort-demographics}
+#cohort-demographics
+#Gender split
+
+cohort %>%
+  group_by(gender) %>%
+  summarise(
+    n   = n(),
+    pct = round(n() / nrow(cohort) * 100, 1)
+  ) %>%
+  kable(col.names = c("Gender", "N", "%"),
+        caption   = "Table 3a. Gender Distribution",
+        booktabs  = TRUE) %>%
+  kable_styling(full_width = FALSE)
+
+# LOS summary
+cohort %>%
+  summarise(
+    median_los = round(median(icu_los_days, na.rm = TRUE), 1),
+    mean_los   = round(mean(icu_los_days,   na.rm = TRUE), 1),
+    q1_los     = round(quantile(icu_los_days, 0.25, na.rm = TRUE), 1),
+    q3_los     = round(quantile(icu_los_days, 0.75, na.rm = TRUE), 1),
+    max_los    = round(max(icu_los_days,    na.rm = TRUE), 1)
+  ) %>%
+  kable(col.names = c("Median LOS", "Mean LOS", "Q1", "Q3", "Max"),
+        caption   = "Table 3b. ICU Length of Stay Summary (days)",
+        booktabs  = TRUE) %>%
+  kable_styling(full_width = FALSE)
+```
+
+------------------------------------------------------------------------
+
+# Statistical Approach
+
+## Why Negative Binomial Regression?
+
+The outcome variables in this analysis are counts — whole numbers that
+can never be negative (medication orders, lab tests, total events).
+Standard linear regression is not appropriate because it can predict
+impossible negative values and assumes a normal distribution that count
+data does not follow.
+
+The simpler count model — Poisson regression — also does not fit here
+because it requires the variance to equal the mean. Our data is far more
+spread out than Poisson can handle. This is called **overdispersion**.
+
+```{r overdispersion-check}
+od <- data.frame(
+  Variable = c("Medication orders", "Lab events", "Total events"),
+  Mean     = round(c(mean(cohort$n_prescriptions, na.rm = TRUE),
+                     mean(cohort$n_lab_events,    na.rm = TRUE),
+                     mean(cohort$total_events,    na.rm = TRUE)), 1),
+  Variance = round(c(var(cohort$n_prescriptions,  na.rm = TRUE),
+                     var(cohort$n_lab_events,     na.rm = TRUE),
+                     var(cohort$total_events,     na.rm = TRUE)), 1),
+  Ratio    = round(c(var(cohort$n_prescriptions,  na.rm = TRUE) /
+                       mean(cohort$n_prescriptions, na.rm = TRUE),
+                     var(cohort$n_lab_events,     na.rm = TRUE) /
+                       mean(cohort$n_lab_events,    na.rm = TRUE),
+                     var(cohort$total_events,     na.rm = TRUE) /
+                       mean(cohort$total_events,    na.rm = TRUE)), 0)
+)
+
+kable(od,
+      col.names = c("Variable", "Mean", "Variance", "Variance / Mean"),
+      caption   = "Table 4. Overdispersion Check.",
+      booktabs  = TRUE) %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(4, bold = TRUE)
+```
+
+Negative binomial regression handles overdispersion by adding a
+dispersion parameter (theta) that absorbs the extra spread in the data.
+This produces honest standard errors and reliable confidence intervals.
+
+## Formal Confirmation: Poisson vs. Negative Binomial
+
+```{r lrt-test}
+cohort_test <- cohort %>%
+  dplyr::filter(icu_los_days > 0, !is.na(anchor_age), !is.na(first_careunit), !is.na(gender),
+    !is.na(n_prescriptions),
+    !is.na(n_lab_events_w),
+    !is.na(total_events))
+
+nb_test <- glm.nb(
+  n_prescriptions ~ anchor_age + gender + first_careunit +
+    offset(log(icu_los_days)), data = cohort_test
+)
+pois_test <- glm(
+  n_prescriptions ~ anchor_age + gender + first_careunit +
+    offset(log(icu_los_days)), family = poisson, data = cohort_test
+)
+
+lrt   <- 2 * (logLik(nb_test) - logLik(pois_test))
+lrt_p <- pchisq(as.numeric(lrt), df = 1, lower.tail = FALSE)
+
+data.frame(
+  Comparison = "Poisson vs. Negative Binomial",
+  ChiSq      = format(round(as.numeric(lrt), 0), big.mark = ","),
+  p_value    = format(lrt_p, scientific = TRUE),
+  NB_Theta   = round(nb_test$theta, 3),
+  Decision   = "Negative Binomial"
+) %>%
+  kable(col.names = c("Comparison", "Chi-Squared", "p-value",
+                      "NB Theta", "Decision"),
+        caption   = "Table 5. Likelihood Ratio Test.",
+        booktabs  = TRUE) %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(5, bold = TRUE)
+```
+
+## What the Offset Term Does
+
+All models include `offset(log(icu_los_days))`. Without this, a 30-day
+stay would appear to have higher burden than a 2-day stay simply because
+of duration, not intensity. The offset converts the model to predict
+**events per ICU day**, making every encounter comparable regardless of
+how long the stay was.
+
+## How to Read the Results (IRR)
+
+```{r irr-guide, echo=FALSE}
+data.frame(
+  IRR     = c("1.0", "1.20", "0.81", "1.035", "0.189"),
+  Meaning = c("No difference from the reference group",
+              "20% MORE events per day than the reference group",
+              "19% FEWER events per day than the reference group",
+              "3.5% more events per day — small but real",
+              "81% FEWER events per day — very large difference"),
+  Example = c("CVICU — our reference unit in Models 1 and 3",
+              "MICU/SICU vs. CVICU",
+              "Example only",
+              "Male vs. Female patients",
+              "Neuro Intermediate vs. CVICU")
+) %>%
+  kable(col.names = c("IRR", "What It Means", "From Our Study"),
+        caption   = "Table 6. How to Read an Incidence Rate Ratio (IRR).",
+        booktabs  = TRUE) %>%
+  kable_styling(font_size = 10) %>%
+  column_spec(1, bold = TRUE)
+```
+
+## Key Results: Forest Plot
+
+```{r irr-forest, fig.height=6}
+data.frame(
+  Unit = c("MICU/SICU","PACU","CVICU (ref)","SICU","Trauma SICU",
+           "CCU","MICU","Neuro SICU","Neuro Stepdown","Neuro Intermediate"),
+  IRR  = c(1.202,1.659,1.000,0.933,0.852,0.859,0.855,0.522,0.418,0.189),
+  Low  = c(1.168,1.344,1.000,0.906,0.826,0.833,0.833,0.492,0.392,0.182),
+  High = c(1.236,2.077,1.000,0.960,0.878,0.885,0.877,0.555,0.447,0.196)
+) %>%
+  mutate(
+    Unit      = reorder(Unit, IRR),
+    Direction = case_when(IRR > 1  ~ "More than CVICU",
+                          IRR == 1 ~ "Reference",
+                          TRUE     ~ "Less than CVICU")
+  ) %>%
+  ggplot(aes(x = IRR, y = Unit, color = Direction)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  geom_errorbarh(aes(xmin = Low, xmax = High), height = 0.3, linewidth = 0.8) +
+  geom_point(size = 3.5) +
+  scale_color_manual(values = c("More than CVICU" = "#C0392B",
+                                "Reference"       = "gray40",
+                                "Less than CVICU" = "#2E5090")) +
+  labs(title   = "Which ICU Units Have Higher or Lower Daily Alert Burden?",
+       x       = "Incidence Rate Ratio (IRR)",
+       y       = NULL, color = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+```
+
+```{r model1-rx}
+
+m1 <- glm.nb(
+  n_prescriptions ~ anchor_age + gender + first_careunit +
+    offset(log(icu_los_days)),
+  data = cohort_test
+)
+
+m1_tidy <- broom::tidy(m1) %>%
+  mutate(
+    IRR = exp(estimate),
+    conf.low = exp(estimate - 1.96 * std.error),
+    conf.high = exp(estimate + 1.96 * std.error),
+    across(c(IRR, conf.low, conf.high), ~ round(., 3)),
+    std.error = round(std.error, 3),
+    statistic = round(statistic, 3),
+    p.value = round(p.value, 4)
+  ) %>%
+  select(term, IRR, std.error, statistic, p.value, conf.low, conf.high)
+
+kable(
+  m1_tidy,
+  col.names = c("Predictor", "IRR", "Std. Error",
+                "Statistic", "p-value",
+                "95% CI Low", "95% CI High"),
+  caption = "Table 7. Model 1 — Medication Orders per Day",
+  booktabs = TRUE
+) %>%
+  kable_styling(font_size = 9)
+
+```
+
+```{r model2-lab}
+
+m2 <- glm.nb(
+  n_lab_events_w ~ anchor_age + gender + first_careunit +
+    offset(log(icu_los_days)),
+  data = cohort_test
+)
+
+m2_tidy <- broom::tidy(m2) %>%
+  mutate(
+    IRR = exp(estimate),
+    conf.low = exp(estimate - 1.96 * std.error),
+    conf.high = exp(estimate + 1.96 * std.error),
+    across(c(IRR, conf.low, conf.high), ~ round(., 3)),
+    std.error = round(std.error, 3),
+    statistic = round(statistic, 3),
+    p.value = round(p.value, 4)
+  ) %>%
+  select(term, IRR, std.error, statistic, p.value, conf.low, conf.high)
+
+kable(
+  m2_tidy,
+  col.names = c("Predictor", "IRR", "Std. Error",
+                "Statistic", "p-value",
+                "95% CI Low", "95% CI High"),
+  caption = "Table 8. Model 2 — Laboratory Events per Day",
+  booktabs = TRUE
+) %>%
+  kable_styling(font_size = 9)
+```
+
+```{r model3-total}
+
+m3 <- glm.nb(
+  total_events ~ anchor_age + gender + first_careunit +
+    offset(log(icu_los_days)),
+  data = cohort_test
+)
+
+m3_tidy <- broom::tidy(m3) %>%
+  mutate(
+    IRR = exp(estimate),
+    conf.low = exp(estimate - 1.96 * std.error),
+    conf.high = exp(estimate + 1.96 * std.error),
+    across(c(IRR, conf.low, conf.high), ~ round(., 3)),
+    std.error = round(std.error, 3),
+    statistic = round(statistic, 3),
+    p.value = round(p.value, 4)
+  ) %>%
+  select(term, IRR, std.error, statistic, p.value, conf.low, conf.high)
+
+kable(
+  m3_tidy,
+  col.names = c("Predictor", "IRR", "Std. Error",
+                "Statistic", "p-value",
+                "95% CI Low", "95% CI High"),
+  caption = "Table 9. Model 3 — Total CDS Events per Day",
+  booktabs = TRUE
+) %>%
+  kable_styling(font_size = 9)
+```
+
+# Visualizations
+
+## Distribution of Total CDS-Triggering Events
+
+```{r plot-total-dist, fig.cap="Figure 2. Distribution of total CDS-triggering events per ICU admission. Medication orders and laboratory measurements combined. X-axis truncated at 3,000; right tail extends to 22,000+. MIMIC-IV, n = 94,444 ICU stays."}
+ggplot(cohort, aes(x = total_events)) +
+  geom_histogram(bins = 60, fill = "#2E5090", color = "white", alpha = 0.85) +
+  scale_x_continuous(labels = comma, limits = c(0, 3000)) +
+  labs(
+    title    = "Distribution of Total CDS-Triggering Events per ICU Admission",
+    subtitle = "Medication orders + laboratory measurements | MIMIC-IV (n = 94,444)",
+    x = "Total Events per Admission", y = "Number of ICU Admissions",
+    caption = "X-axis truncated at 3,000. Right tail extends to 22,000+."
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Event Rate by ICU Unit Type
+
+```{r plot-unit-boxplot, fig.height=6, fig.cap="Figure 3. Daily CDS-triggering event rate by ICU unit type. Events per ICU day (medication orders + lab measurements). Y-axis truncated at 500 for readability. MIMIC-IV."}
+ggplot(cohort %>% dplyr::filter(!is.na(first_careunit)),
+       aes(x = reorder(first_careunit, total_events_per_day, median, na.rm = TRUE),
+           y = total_events_per_day, fill = first_careunit)) +
+  geom_boxplot(outlier.alpha = 0.2, outlier.size = 0.6) +
+  coord_flip() +
+  scale_y_continuous(labels = comma, limits = c(0, 500)) +
+  labs(
+    title    = "Daily CDS-Triggering Event Rate by ICU Unit Type",
+    subtitle = "Events per ICU day | MIMIC-IV",
+    x = NULL, y = "Events per ICU Day",
+    caption = "Y-axis truncated at 500 for readability."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+## Medication Orders vs. Lab Events
+
+```{r plot-rx-vs-lab, fig.cap="Figure 4. Relationship between medication orders and laboratory events per ICU admission. Each point represents one ICU stay. Axes truncated for readability. Orange line shows OLS trend with 95% confidence interval. MIMIC-IV."}
+ggplot(cohort %>% dplyr::filter(n_prescriptions < 500, n_lab_events < 2000),
+       aes(x = n_prescriptions, y = n_lab_events)) +
+  geom_point(alpha = 0.08, size = 0.6, color = "#2E5090") +
+  geom_smooth(method = "lm", color = "#E05A1E", se = TRUE, linewidth = 1) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Medication Orders vs. Laboratory Events per Admission",
+    subtitle = "Each point = one ICU stay | axes truncated for readability",
+    x = "Prescription Orders (n)", y = "Laboratory Events (n)",
+    caption = "Orange line = OLS trend with 95% CI."
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Suppression Scenario Comparison
+
+```{r plot-scenarios, fig.cap="Figure 5. Estimated CDS event burden under three suppression scenarios compared to baseline. S1 = medication order deduplication (-15%); S2 = laboratory event suppression (-20%); S3 = combined strategy. Events truncated at 3,000 for readability. MIMIC-IV, n = 94,444."}
+ggplot(scenario_long, aes(x = Events, fill = Scenario)) +
+  geom_density(alpha = 0.55) +
+  scale_fill_manual(values = c("#1F3864", "#2E75B6", "#E05A1E", "#70AD47")) +
+  labs(
+    title    = "Estimated CDS Event Burden Under Suppression Scenarios",
+    subtitle = "Density of total events per admission | MIMIC-IV",
+    x = "Total CDS-Triggering Events per Admission",
+    y = "Density", fill = NULL,
+    caption = "Events truncated at 3,000 for readability."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+## ICU Length of Stay Distribution
+
+```{r plot-los, fig.cap="Figure 6. ICU length of stay distribution. Stays exceeding 30 days (less than 1% of cohort) excluded for readability. MIMIC-IV, n = 94,444."}
+ggplot(cohort %>% dplyr::filter(icu_los_days <= 30), aes(x = icu_los_days)) +
+  geom_histogram(bins = 60, fill = "#2E5090", color = "white", alpha = 0.85) +
+  labs(
+    title    = "ICU Length of Stay Distribution",
+    subtitle = "Stays <= 30 days shown | MIMIC-IV",
+    x = "ICU Length of Stay (days)", y = "Number of ICU Admissions",
+    caption = "Stays > 30 days (n < 1%) excluded for readability."
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+------------------------------------------------------------------------
+
+# Temporal Clustering Visualizations
+
+## Medication Orders by Hour of Day
+
+```{r plot-hourly, fig.cap="Figure 7. Medication order activity by hour of day across all ICU cohort admissions. Orange bars indicate the three peak hours: 8am (10.7%), 8pm (9.0%), and 10am (7.2%). MIMIC-IV, 8,578,568 total orders."}
+ggplot(hourly_counts, aes(x = order_hour, y = n_orders)) +
+  geom_col(fill = "#2E5090", alpha = 0.85) +
+  geom_col(
+    data = hourly_counts %>% dplyr::filter(order_hour %in% top_hours$order_hour),
+    fill = "#E05A1E", alpha = 0.9
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 23, 2),
+    labels = c("12am","2am","4am","6am","8am","10am",
+               "12pm","2pm","4pm","6pm","8pm","10pm")
+  ) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Medication Order Activity by Hour of Day",
+    subtitle = "Orange bars = top 3 peak hours | MIMIC-IV ICU cohort",
+    x = "Hour of Day", y = "Total Medication Orders",
+    caption = "Peak hours: 8am (10.7%), 8pm (9.0%), 10am (7.2%)."
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Orders by Clinical Shift
+
+```{r plot-shift, fig.cap="Figure 8. Medication order volume by clinical shift. Day and evening shifts together account for 81.4% of all orders. MIMIC-IV ICU cohort."}
+ggplot(shift_summary, aes(x = shift, y = n_orders, fill = shift)) +
+  geom_col(alpha = 0.85) +
+  geom_text(aes(label = paste0(pct, "%")),
+            vjust = -0.5, size = 4.5, fontface = "bold") +
+  scale_fill_manual(values = c("#2E5090", "#E05A1E", "#1F3864")) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title    = "Medication Order Volume by Clinical Shift",
+    subtitle = "MIMIC-IV ICU cohort",
+    x = NULL, y = "Total Medication Orders",
+    caption = "Day + Evening shifts account for 81.4% of all orders."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+## Orders by Day of ICU Stay
+
+```{r plot-dayofstay, fig.cap="Figure 9. Average medication orders per admission by ICU day of stay. Days 1 through 14 shown. Day 1 corresponds to ICU admission day. Orange line shows loess smoothing trend. MIMIC-IV ICU cohort."}
+ggplot(daily_burden, aes(x = day_of_stay, y = orders_per_adm)) +
+  geom_line(color = "#2E5090", linewidth = 1.2) +
+  geom_point(color = "#2E5090", size = 2.5) +
+  geom_smooth(method = "loess", color = "#E05A1E",
+              se = TRUE, alpha = 0.15, linewidth = 1) +
+  scale_x_continuous(breaks = 1:14) +
+  labs(
+    title    = "Average Medication Orders per Admission by ICU Day of Stay",
+    subtitle = "Days 1-14 shown | MIMIC-IV ICU cohort",
+    x = "Day of ICU Stay", y = "Mean Orders per Admission",
+    caption = "Day 1 = ICU admission day. Orange = loess trend."
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## 60-Minute Burst Distribution
+
+```{r plot-burst, fig.height=5, fig.cap="Figure 10. Distribution of maximum medication orders placed within any 60-minute window per ICU admission. Dashed lines mark High (20+) and Very High (30+) thresholds. X-axis truncated at 100; maximum observed value was 432. Median = 18. MIMIC-IV."}
+ggplot(burst_metric, aes(x = max_burst_60min)) +
+  geom_histogram(bins = 50, fill = "#2E5090", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = 20, linetype = "dashed",
+             color = "#E05A1E", linewidth = 1) +
+  geom_vline(xintercept = 30, linetype = "dashed",
+             color = "#C0392B", linewidth = 1) +
+  annotate("text", x = 20.5, y = Inf, label = "High\nthreshold",
+           vjust = 1.5, hjust = 0, size = 3.5, color = "#E05A1E") +
+  annotate("text", x = 30.5, y = Inf, label = "Very High\nthreshold",
+           vjust = 1.5, hjust = 0, size = 3.5, color = "#C0392B") +
+  scale_x_continuous(limits = c(0, 100)) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Distribution of Max Medication Orders in Any 60-Minute Window",
+    subtitle = "Per ICU admission | MIMIC-IV",
+    x = "Max Orders in 60-Minute Window", y = "Number of Admissions",
+    caption = "X-axis truncated at 100; max observed = 432. Median = 18."
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Burst Intensity by Category
+
+```{r plot-burst-category, fig.height=4, fig.cap="Figure 11. Percentage of ICU admissions by 60-minute burst intensity category. Thresholds: Low <10, Moderate 10-19, High 20-29, Very High 30+ orders per hour. MIMIC-IV."}
+burst_cat_summary <- burst_metric %>%
+  group_by(burst_category) %>%
+  summarise(n = n(), pct = round(n() / nrow(burst_metric) * 100, 1),
+            .groups = "drop")
+
+ggplot(burst_cat_summary, aes(x = burst_category, y = pct, fill = burst_category)) +
+  geom_col(alpha = 0.85) +
+  geom_text(aes(label = paste0(pct, "%")),
+            vjust = -0.5, size = 4.5, fontface = "bold") +
+  scale_fill_manual(values = c("#70AD47","#2E75B6","#E05A1E","#C0392B")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title    = "ICU Admissions by 60-Minute Burst Intensity Category",
+    subtitle = "MIMIC-IV ICU cohort",
+    x = NULL, y = "Percent of Admissions"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+------------------------------------------------------------------------
+
+# Preprocessing Notes
+
+The following decisions were made during data preparation. Each is
+documented with the reason it was made so the analysis can be understood
+and reproduced.
+
+**Lab events queried via DuckDB** — The labevents file in MIMIC-IV
+contains tens of millions of rows, exceeding available RAM. DuckDB was
+used to run SQL queries directly on disk, pulling only rows belonging to
+patients in the ICU cohort without loading the full file into memory.
+
+**Prescriptions loaded with `select = c(...)`** — Only the five columns
+needed for analysis were loaded from the prescriptions file, reducing
+RAM usage by approximately 80% compared to loading all 26 columns.
+
+**Prescription counts aggregated before joining** — Medication orders
+were summarized at the admission level before merging with the ICU
+cohort. Joining raw prescription records directly would have multiplied
+the number of rows in the dataset by hundreds, making it unmanageable.
+
+**ICU units with n \< 200 collapsed to "Other"** — Eight ICU unit types
+had fewer than 200 stays. Units this small cause convergence failure in
+negative binomial estimation because the model cannot reliably estimate
+coefficients from so few observations.
+
+**Lab counts winsorized at the 99th percentile (3,086)** — The maximum
+lab event count was 19,824. Values this extreme caused the negative
+binomial model to fail. Winsorizing replaced the top 1% of values with
+the 99th percentile cap, leaving 99% of the data unchanged.
+
+**Rate variables derived (events per ICU day)** — Raw counts are
+confounded by length of stay. A patient staying 30 days accumulates more
+events than a 2-day patient regardless of care intensity. Dividing by
+ICU days produces a fair per-day rate for comparison.
+
+**Negative binomial over Poisson** — Confirmed by likelihood ratio test:
+Chi-sq = 8,224,010, p ≈ 0. Variance-to-mean ratios of 119 to 1,178
+across outcomes confirm severe overdispersion (see Table 4 and Table 5).
+
+**Cohort lookup deduplicated before temporal join** — Some hospital
+admissions contain multiple ICU stays, giving multiple intime values per
+hadm_id. A deduplicated lookup table was created before joining
+prescription timestamps to prevent row multiplication in the temporal
+analysis.
+
+**Burst thresholds recalibrated to 10/20/30** — The original thresholds
+(2/5/10) classified 80.7% of admissions as High because the median burst
+in this dataset is 18 orders per hour. Recalibrated thresholds produce a
+meaningful spread across all four categories (see Figure 11).
+
+```{r Descriptive-Summary}
+
+# Medication orders summary
+cohort %>%
+  summarise(
+    mean_rx     = round(mean(n_prescriptions, na.rm = TRUE), 1),
+    median_rx   = round(median(n_prescriptions, na.rm = TRUE), 1),
+    sd_rx       = round(sd(n_prescriptions, na.rm = TRUE), 1),
+    mean_rxpd   = round(mean(rx_per_day, na.rm = TRUE), 1),
+    median_rxpd = round(median(rx_per_day, na.rm = TRUE), 1)
+  )
+
+# Lab events summary
+cohort %>%
+  summarise(
+    mean_lab     = round(mean(n_lab_events, na.rm = TRUE), 1),
+    median_lab   = round(median(n_lab_events, na.rm = TRUE), 1),
+    sd_lab       = round(sd(n_lab_events, na.rm = TRUE), 1),
+    mean_labpd   = round(mean(labs_per_day, na.rm = TRUE), 1),
+    median_labpd = round(median(labs_per_day, na.rm = TRUE), 1)
+  )
+
+# Total events summary
+cohort %>%
+  summarise(
+    mean_total     = round(mean(total_events, na.rm = TRUE), 1),
+    median_total   = round(median(total_events, na.rm = TRUE), 1),
+    mean_totalpd   = round(mean(total_events_per_day, na.rm = TRUE), 1),
+    median_totalpd = round(median(total_events_per_day, na.rm = TRUE), 1)
+  )
+```
